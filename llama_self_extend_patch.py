@@ -205,3 +205,132 @@ def self_extend_forward(
         attn_weights = None
 
     return attn_output, attn_weights, past_key_value
+
+
+def self_extend_forward_phi(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    group_size_1: Optional[float] = 8,
+    group_size_2: Optional[float] = 1024,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    
+    bsz, q_len, _ = hidden_states.size()
+
+    # [batch_size, seq_length, 3 x hidden_size]
+    fused_qkv = self.query_key_value(hidden_states)
+
+    # 3 x [batch_size, seq_length, num_heads, head_dim]
+    (query_states, key_states, value_states) = self._split_heads(fused_qkv)
+
+    if self.qk_layernorm:
+        query_states = self.q_layernorm(query_states)
+        key_states = self.k_layernorm(key_states)
+
+    # [batch_size, num_heads, seq_length, head_dim] -> [batch_size, seq_length, num_heads, head_dim]
+    query_states = query_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        raise ValueError("past_key_value is not supported for now.")
+        #kv_seq_len += past_key_value[0].shape[-2]
+
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    
+
+    # Partial rotary embedding
+    query_rot, query_pass = (
+        query_states[..., : self.rotary_emb.dim],
+        query_states[..., self.rotary_emb.dim :],
+    )
+    key_rot, key_pass = (
+        key_states[..., : self.rotary_emb.dim],
+        key_states[..., self.rotary_emb.dim :],
+    )
+    
+    neighbor_query_rot, neighbor_key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids) # normal attention 
+    
+    # [batch_size, seq_length, num_heads, head_dim]
+    neighbor_query_states = torch.cat((neighbor_query_rot, query_pass), dim=-1)
+    neighbor_key_states = torch.cat((neighbor_key_rot, key_pass), dim=-1)
+
+    if past_key_value is not None:
+            # Specific to RoPE models with partial rotation
+            raise ValueError("Not Supported")
+            #cache_kwargs = {"sin": sin, "cos": cos, "partial_rotation_size": self.rotary_emb.dim}
+            #key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    # ********************************************************************************************************************* #
+
+    _re_group_size_2 = 0 if position_ids.max() < group_size_2 else group_size_2 # in case that, the smallest q position, g2-g2//g1 exceed the max position
+    group_query_rot, group_key_rot = apply_grouped_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids, g_size_1=group_size_1, g_size_2=_re_group_size_2) # grouped attention
+    
+    group_query_states = torch.cat((group_query_rot, query_pass), dim=-1)
+    group_key_states = torch.cat((group_key_rot, key_pass), dim=-1)
+
+    group_key_states = repeat_kv(group_key_states, 1)
+    neighbor_key_states = repeat_kv(neighbor_key_states, 1)
+    value_states = repeat_kv(value_states, 1)
+
+    neighbor_attn_weights = torch.matmul(neighbor_query_states, neighbor_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+    group_attn_weights = torch.matmul(group_query_states, group_key_states.transpose(2, 3)) / math.sqrt(self.head_dim) 
+    
+    if group_attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+            f" {group_attn_weights.size()}"
+        )
+    
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+        group_attn_weights = group_attn_weights + attention_mask
+        neighbor_attn_weights = neighbor_attn_weights + attention_mask # causal mask. 
+    
+    if q_len == 1:
+        # take effect with KV cache. 
+        neighbor_attention_mask = torch.zeros((q_len, kv_seq_len), device=neighbor_attn_weights.device)
+        neighbor_attention_mask[:, -group_size_2:] = 1
+    elif q_len == kv_seq_len:
+        # no cache OR prefill
+        neighbor_attention_mask = torch.ones((q_len, kv_seq_len), device=neighbor_attn_weights.device)
+        neighbor_attention_mask = torch.tril(neighbor_attention_mask)
+        if q_len-group_size_2 > 0:
+            # seq length is larger than group_size_2, should do replacement. 
+            group_attention_mask =  torch.tril(torch.ones((q_len-group_size_2, kv_seq_len-group_size_2), device=group_attn_weights.device))
+            neighbor_attention_mask[group_size_2:, :-group_size_2] -= group_attention_mask
+
+    else:
+        raise ValueError("q_len should be 1 or seq_len.")
+
+    merged_attn_weights = torch.where(neighbor_attention_mask.bool(), neighbor_attn_weights, group_attn_weights) # replace the group attention with neighbor attention within the neighbor window. 
+    merged_attn_weights = nn.functional.softmax(merged_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype) 
+
+    # ********************************************************************************************************************* #
+    
+    attn_output = torch.matmul(merged_attn_weights, value_states)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+   
+    attn_output = self.dense(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
