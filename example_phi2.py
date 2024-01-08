@@ -13,9 +13,9 @@ self_extend_forward = partial(LlamaSE.self_extend_forward_phi, group_size_1=8, g
 
 
 model_path = 'susnato/phi-2'
-cache_dir = '/mnt/c/Users/amangokrani/OneDrive - Microsoft/Personal/Huggingface/models'
+cache_dir = '/workspace/models'
 # model_path = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
-model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=cache_dir)
+model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=cache_dir, device_map="cuda")
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model.eval()
 
@@ -28,3 +28,4 @@ inputs = tokenizer('''def print_prime(n):
 )
 
 outputs = model.generate(**inputs, max_length=35)
+import pdb;pdb.set_trace()
